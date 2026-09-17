@@ -1,0 +1,1 @@
+Use rtk for commands. Preserve existing behavior and signed history. Do not change dependencies without explicit approval. Validate with focused cargo nextest tests and isolated synthetic fixtures. Obtain explicit approval before changing file-deletion paths. Never execute updater operations against a live installation during tests.

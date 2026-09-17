@@ -1,0 +1,39 @@
+[package]
+name = "application-updater"
+version = "0.1.0"
+edition = "2024"
+license-file = "LICENSE"
+description = "Signed in-application upgrade core: manifest validation, download, verification, extraction, promotion, rollback and the Windows helper handoff"
+
+[dependencies]
+artifact-trust = { git = "https://github.com/scryer-media/artifact-trust.git", tag = "v0.1.1", default-features = false, features = ["verification"] }
+blake3 = "1"
+chrono = { version = "0.4", features = ["serde"] }
+flate2 = "1"
+futures-util = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream"] }
+semver = "1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+tar = "0.4"
+thiserror = "2.0"
+tokio = { version = "1.53", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+url = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+# The HTTP client is built with `rustls-no-provider`; the host normally installs
+# the process-wide provider, so the tests install one of their own.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
+tempfile = "3"
+tokio = { version = "1.53", features = ["macros", "rt-multi-thread"] }
