@@ -57,8 +57,8 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "artifact-trust"
-version = "0.1.1"
-source = "git+https://github.com/scryer-media/artifact-trust.git?tag=v0.1.1#fe348b428489fb9ab4744e3b6dbf804688dcb33c"
+version = "0.1.2"
+source = "git+https://github.com/scryer-media/artifact-trust.git?tag=v0.1.2#b0753163049ddcb4e0eacfa92161beca753c1f53"
 dependencies = [
  "aws-lc-rs",
  "base64",

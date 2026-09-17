@@ -3,6 +3,8 @@ name = "application-updater"
 version = "0.1.0"
 edition = "2024"
 license-file = "LICENSE"
+repository = "https://github.com/scryer-media/application-updater"
+publish = false
 description = "Signed in-application upgrade core: manifest validation, download, verification, extraction, promotion, rollback and the Windows helper handoff"
 
 [features]
@@ -11,7 +13,7 @@ description = "Signed in-application upgrade core: manifest validation, download
 test-seams = []
 
 [dependencies]
-artifact-trust = { git = "https://github.com/scryer-media/artifact-trust.git", tag = "v0.1.1", default-features = false, features = ["verification"] }
+artifact-trust = { git = "https://github.com/scryer-media/artifact-trust.git", tag = "v0.1.2", default-features = false, features = ["verification"] }
 blake3 = "1"
 chrono = { version = "0.4", features = ["serde"] }
 flate2 = "1"

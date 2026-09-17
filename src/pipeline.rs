@@ -310,6 +310,9 @@ pub async fn fetch_upgrade_manifest(
     .await
 }
 
+/// Stands in for signature verification: manifest bytes, bundle bytes, tag.
+pub type VerifySignatureOverride = fn(&[u8], &[u8], &str) -> Result<()>;
+
 /// Test seams for [`fetch_upgrade_manifest`].
 ///
 /// Both are `None` in production, where the manifests come from the product's
@@ -324,7 +327,7 @@ pub struct UpgradeManifestFetchOverrides<'a> {
     pub asset_base: Option<&'a url::Url>,
     /// Replaces signature verification. Called with the raw manifest bytes, the
     /// raw bundle bytes and the release tag.
-    pub verify_signature: Option<fn(&[u8], &[u8], &str) -> Result<()>>,
+    pub verify_signature: Option<VerifySignatureOverride>,
 }
 
 /// [`fetch_upgrade_manifest`] with its test seams exposed.

@@ -476,8 +476,7 @@ mod tests {
             |_| Err(Error::Validation("injected codesign failure".to_string())),
             |from, to| fs::rename(from, to),
         )
-        .err()
-        .expect("verification failure stops the promotion");
+        .expect_err("verification failure stops the promotion");
         let (error, restored) = failure.into_parts();
         assert!(error.to_string().contains("injected codesign failure"));
         assert!(restored);
@@ -493,8 +492,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let paths = paths_for(temp.path());
         let failure = apply_macos_bundle_upgrade(&paths, accept, |from, to| fs::rename(from, to))
-            .err()
-            .expect("an empty staging directory stops the promotion");
+            .expect_err("an empty staging directory stops the promotion");
         assert!(
             failure
                 .into_parts()
@@ -520,8 +518,7 @@ mod tests {
             }
             fs::rename(from, to)
         })
-        .err()
-        .expect("the swap fails");
+        .expect_err("the swap fails");
         let (error, restored) = failure.into_parts();
         assert!(
             error
@@ -552,8 +549,7 @@ mod tests {
             }
             fs::rename(from, to)
         })
-        .err()
-        .expect("the swap fails");
+        .expect_err("the swap fails");
         let (error, restored) = failure.into_parts();
         assert!(!restored);
         assert!(
