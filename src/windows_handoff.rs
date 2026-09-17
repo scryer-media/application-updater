@@ -147,6 +147,8 @@ pub fn build_windows_upgrade_handoff(
         phase: phases::RESTARTING.to_string(),
         helper_error: None,
         written_at: Some(input.written_at),
+        macos_bundle_upgrade: false,
+        staging_dir: None,
     };
     let plan = ApplicationUpgradeHelperPlan {
         schema: product.helper_plan_schema.to_string(),

@@ -31,6 +31,14 @@ pub struct ProductDescriptor {
     pub manifest_signature_asset_name: &'static str,
     /// Schema identifier accepted for signed upgrade manifests.
     pub manifest_schema: &'static str,
+    /// Release-asset filename of the signed v2 upgrade manifest.
+    pub manifest_v2_asset_name: &'static str,
+    /// Release-asset filename of the v2 manifest's Sigstore bundle.
+    pub manifest_v2_signature_asset_name: &'static str,
+    /// Schema identifier accepted for signed v2 upgrade manifests.
+    pub manifest_v2_schema: &'static str,
+    /// macOS application-bundle directory name, e.g. `ExampleApp.app`.
+    pub macos_bundle_name: &'static str,
     /// Schema identifier written into the durable upgrade journal.
     pub journal_schema: &'static str,
     /// Schema identifier written into the Windows helper plan.
@@ -133,6 +141,10 @@ pub(crate) mod test_product {
         manifest_asset_name: "exampleapp-upgrade-manifest.json",
         manifest_signature_asset_name: "exampleapp-upgrade-manifest.json.sigstore.json",
         manifest_schema: "exampleapp.upgrade.manifest.v1",
+        manifest_v2_asset_name: "exampleapp-upgrade-manifest.v2.json",
+        manifest_v2_signature_asset_name: "exampleapp-upgrade-manifest.v2.json.sigstore.json",
+        manifest_v2_schema: "exampleapp.upgrade.manifest.v2",
+        macos_bundle_name: "ExampleApp.app",
         journal_schema: "exampleapp.upgrade.journal.v1",
         helper_plan_schema: "exampleapp.upgrade.helper-plan.v1",
         windows_server_executable: "exampleapp.exe",

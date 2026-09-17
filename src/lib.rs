@@ -22,6 +22,7 @@ pub mod helper;
 pub mod helper_plan;
 pub mod installation;
 pub mod journal;
+pub mod macos_bundle;
 pub mod manifest;
 pub mod pipeline;
 pub mod product;

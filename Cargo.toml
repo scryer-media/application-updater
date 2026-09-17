@@ -5,6 +5,11 @@ edition = "2024"
 license-file = "LICENSE"
 description = "Signed in-application upgrade core: manifest validation, download, verification, extraction, promotion, rollback and the Windows helper handoff"
 
+[features]
+# Exposes seams that can stand in for signature verification. For the test
+# targets of a host crate only; never enable it in a shipped build.
+test-seams = []
+
 [dependencies]
 artifact-trust = { git = "https://github.com/scryer-media/artifact-trust.git", tag = "v0.1.1", default-features = false, features = ["verification"] }
 blake3 = "1"

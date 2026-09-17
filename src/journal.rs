@@ -31,6 +31,16 @@ pub struct ApplicationUpgradeJournal {
     pub helper_error: Option<String>,
     #[serde(default)]
     pub written_at: Option<DateTime<Utc>>,
+    /// Whether this run replaced a macOS application bundle rather than an
+    /// executable. Additive and defaulted: a journal written before bundle
+    /// upgrades existed reads as `false`, which is exactly what it was.
+    #[serde(default)]
+    pub macos_bundle_upgrade: bool,
+    /// The sibling staging directory a bundle upgrade extracted into, so the
+    /// next boot can remove it without re-deriving it. Additive and defaulted;
+    /// `None` for every run that is not a bundle upgrade.
+    #[serde(default)]
+    pub staging_dir: Option<PathBuf>,
 }
 
 pub fn write_journal(path: &Path, journal: &ApplicationUpgradeJournal) -> Result<()> {
@@ -217,6 +227,8 @@ mod tests {
             phase: phases::RESTARTING.to_string(),
             helper_error: None,
             written_at: Some(Utc::now()),
+            macos_bundle_upgrade: false,
+            staging_dir: None,
         };
         write_journal(&path, &journal).expect("write journal");
         assert_eq!(load_journal(&path).expect("load journal"), Some(journal));
@@ -246,6 +258,35 @@ mod tests {
             .expect("journal exists");
         assert!(journal.backup_paths.is_empty());
         assert_eq!(journal.written_at, None);
+        // The bundle-upgrade fields were added after this journal shape
+        // shipped; a journal that predates them describes a run that was not a
+        // bundle upgrade, which is exactly what the defaults say.
+        assert!(!journal.macos_bundle_upgrade);
+        assert_eq!(journal.staging_dir, None);
+    }
+
+    #[test]
+    fn a_bundle_upgrade_journal_round_trips_its_additive_fields() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("application-upgrade/journal.json");
+        let journal = ApplicationUpgradeJournal {
+            schema: EXAMPLEAPP.journal_schema.to_string(),
+            run_id: "run-2".to_string(),
+            expected_version: "1.2.3".to_string(),
+            expected_tag: "v1.2.3".to_string(),
+            executable_path: PathBuf::from("/Applications/ExampleApp.app"),
+            backup_path: PathBuf::from("/Applications/ExampleApp.app.pre-upgrade-1.2.2"),
+            backup_paths: vec![PathBuf::from(
+                "/Applications/ExampleApp.app.pre-upgrade-1.2.2",
+            )],
+            phase: phases::RESTARTING.to_string(),
+            helper_error: None,
+            written_at: Some(Utc::now()),
+            macos_bundle_upgrade: true,
+            staging_dir: Some(PathBuf::from("/Applications/.exampleapp-upgrade-new-1.2.3")),
+        };
+        write_journal(&path, &journal).expect("write journal");
+        assert_eq!(load_journal(&path).expect("load journal"), Some(journal));
     }
 
     #[test]
@@ -265,6 +306,8 @@ mod tests {
             phase: phases::RESTARTING.to_string(),
             helper_error: None,
             written_at: Some(Utc::now()),
+            macos_bundle_upgrade: false,
+            staging_dir: None,
         };
         write_journal(&path, &journal).expect("write journal");
 

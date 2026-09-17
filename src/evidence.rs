@@ -13,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::ProductDescriptor;
 use crate::installation::{
     InstallationAssessment, InstallationEvidence, InstallationOs, classify_installation,
+    is_app_translocated, macos_app_bundle_path,
 };
 
 static WRITABILITY_PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -22,8 +23,29 @@ pub fn collect_installation_assessment(product: &ProductDescriptor) -> Installat
     let (windows_distribution_owner, windows_legacy_msi_registry_key_exists) =
         windows_registry_evidence(product);
 
+    // The bundle is replaced by renaming it inside its parent directory, so the
+    // parent is what has to be writable — and a read-only filesystem is named
+    // separately, because "drag Scryer to Applications" and "fix these
+    // permissions" are different instructions to the person reading them.
+    let bundle_probe = executable_path
+        .as_deref()
+        .and_then(macos_app_bundle_path)
+        .map(|bundle| {
+            (
+                is_app_translocated(bundle),
+                bundle.parent().map_or(DirectoryProbe::Denied, |parent| {
+                    probe_directory(product, parent)
+                }),
+            )
+        });
+
     let evidence = InstallationEvidence {
         disable_self_upgrade: env::var(product.disable_self_upgrade_env).ok(),
+        macos_app_bundle_parent_writable: bundle_probe
+            .is_some_and(|(_, probe)| probe == DirectoryProbe::Writable),
+        macos_app_translocated: bundle_probe.is_some_and(|(translocated, _)| translocated),
+        macos_bundle_volume_read_only: bundle_probe
+            .is_some_and(|(_, probe)| probe == DirectoryProbe::ReadOnlyFilesystem),
         package: env::var(product.package_env).ok(),
         executable_dir_writable: executable_dir_writable(product, executable_path.as_deref()),
         docker_env_present: Path::new("/.dockerenv").exists(),
@@ -65,9 +87,32 @@ fn current_os() -> InstallationOs {
 }
 
 fn executable_dir_writable(product: &ProductDescriptor, executable_path: Option<&Path>) -> bool {
-    let Some(directory) = executable_path.and_then(Path::parent) else {
-        return false;
-    };
+    executable_path
+        .and_then(Path::parent)
+        .is_some_and(|directory| directory_writable(product, directory))
+}
+
+/// Whether `directory` accepts a create-and-delete probe.
+///
+/// A probe rather than a permission bit: only actually creating a file proves
+/// the directory is writable through ACLs, read-only mounts and sandboxes alike.
+fn directory_writable(product: &ProductDescriptor, directory: &Path) -> bool {
+    probe_directory(product, directory) == DirectoryProbe::Writable
+}
+
+/// What a create-and-delete probe of a directory found.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectoryProbe {
+    /// A file was created and removed again.
+    Writable,
+    /// The filesystem itself is mounted read-only — a bundle still running
+    /// from its distribution disk image sees exactly this.
+    ReadOnlyFilesystem,
+    /// Writable-looking filesystem, but this process may not write here.
+    Denied,
+}
+
+fn probe_directory(product: &ProductDescriptor, directory: &Path) -> DirectoryProbe {
     let unique_suffix = format!(
         "{}-{}-{}",
         std::process::id(),
@@ -78,16 +123,23 @@ fn executable_dir_writable(product: &ProductDescriptor, executable_path: Option<
     );
     let probe_path = directory.join(format!("{}{unique_suffix}", product.write_probe_prefix));
 
-    let created = OpenOptions::new()
+    match OpenOptions::new()
         .create_new(true)
         .write(true)
         .open(&probe_path)
-        .is_ok();
-    if !created {
-        return false;
+    {
+        Ok(_) => {
+            if fs::remove_file(probe_path).is_ok() {
+                DirectoryProbe::Writable
+            } else {
+                DirectoryProbe::Denied
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::ReadOnlyFilesystem => {
+            DirectoryProbe::ReadOnlyFilesystem
+        }
+        Err(_) => DirectoryProbe::Denied,
     }
-
-    fs::remove_file(probe_path).is_ok()
 }
 
 #[cfg(windows)]

@@ -1,6 +1,6 @@
 //! Installation-layout classification for the in-application upgrade surface.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Operating-system family observed while collecting installation evidence.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -43,8 +43,17 @@ pub struct InstallationEvidence {
     pub windows_executable_under_program_files: bool,
     /// Whether the legacy product machine registry key exists.
     pub windows_legacy_msi_registry_key_exists: bool,
-    /// Whether the Windows tray launched and supervises this process.
+    /// Whether the desktop tray launched and supervises this process.
     pub tray_supervised: bool,
+    /// Whether the macOS `.app` bundle's parent directory accepted a
+    /// create-and-delete probe. Only meaningful for a bundle layout.
+    pub macos_app_bundle_parent_writable: bool,
+    /// Whether the running bundle was launched through Gatekeeper's App
+    /// Translocation, which mounts it on a throwaway read-only image.
+    pub macos_app_translocated: bool,
+    /// Whether the volume holding the bundle is mounted read-only, which is
+    /// what a bundle still running from its distribution disk image looks like.
+    pub macos_bundle_volume_read_only: bool,
 }
 
 /// Installation layout classification used by the in-app upgrade surface.
@@ -52,6 +61,8 @@ pub struct InstallationEvidence {
 pub enum InstallationKind {
     Portable,
     DirectMsi,
+    /// A macOS `.app` bundle upgraded in place by replacing the whole bundle.
+    MacosAppBundle,
     Docker,
     Homebrew,
     Winget,
@@ -78,6 +89,15 @@ pub enum EligibilityReason {
     Eligible,
     UnsupportedLayout,
     InstallDirNotWritable,
+    /// The `.app` bundle is running from Gatekeeper's App Translocation copy,
+    /// so the path it sees is a throwaway read-only mount, not the install.
+    AppBundleTranslocated,
+    /// The `.app` bundle is running from a read-only volume — a mounted disk
+    /// image, most often the one it was distributed on.
+    AppBundleReadOnlyVolume,
+    /// The `.app` bundle is not supervised by the tray inside it, so nothing
+    /// can relaunch the application once the bundle has been replaced.
+    AppBundleNotTraySupervised,
 }
 
 impl EligibilityReason {
@@ -92,6 +112,9 @@ impl EligibilityReason {
             Self::Eligible => "eligible",
             Self::UnsupportedLayout => "unsupported_layout",
             Self::InstallDirNotWritable => "install_dir_not_writable",
+            Self::AppBundleTranslocated => "app_bundle_translocated",
+            Self::AppBundleReadOnlyVolume => "app_bundle_read_only_volume",
+            Self::AppBundleNotTraySupervised => "app_bundle_not_tray_supervised",
         }
     }
 }
@@ -179,17 +202,43 @@ pub fn classify_installation(evidence: &InstallationEvidence) -> InstallationAss
         );
     }
 
-    // A macOS .app is a signed, self-contained bundle: replacing the binaries
-    // inside it in place breaks the bundle's signature and, for an ad-hoc
-    // signature, leaves an app Gatekeeper will refuse to launch. /Applications
-    // is writable by an admin user, so without this the bundle would classify
-    // as Portable and the in-app upgrade would happily corrupt it. The user is
-    // pointed at the download page instead.
+    // A macOS .app is a signed, self-contained bundle: replacing individual
+    // binaries inside it would break the bundle's signature and, for an ad-hoc
+    // signature, leave an app Gatekeeper refuses to launch. /Applications is
+    // writable by an admin user, so without this branch the bundle would
+    // classify as Portable and the portable promotion would happily corrupt it.
+    //
+    // The bundle is instead upgraded whole: a fully signed replacement bundle
+    // is staged beside it and swapped in by rename. That is only possible when
+    // the bundle really is the install — not a translocated copy, not the
+    // distribution disk image — its parent directory is writable, and the tray
+    // inside it supervises this process and can relaunch the new bundle.
     if evidence.os == InstallationOs::Macos && is_macos_app_bundle(evidence) {
-        return operator_assessment(
-            InstallationKind::Unsupported,
-            EligibilityReason::UnsupportedLayout,
-        );
+        if evidence.macos_app_translocated {
+            return operator_assessment(
+                InstallationKind::MacosAppBundle,
+                EligibilityReason::AppBundleTranslocated,
+            );
+        }
+        if evidence.macos_bundle_volume_read_only {
+            return operator_assessment(
+                InstallationKind::MacosAppBundle,
+                EligibilityReason::AppBundleReadOnlyVolume,
+            );
+        }
+        if !evidence.macos_app_bundle_parent_writable {
+            return operator_assessment(
+                InstallationKind::MacosAppBundle,
+                EligibilityReason::InstallDirNotWritable,
+            );
+        }
+        if !evidence.tray_supervised {
+            return operator_assessment(
+                InstallationKind::MacosAppBundle,
+                EligibilityReason::AppBundleNotTraySupervised,
+            );
+        }
+        return in_app_assessment(InstallationKind::MacosAppBundle, true);
     }
 
     if evidence.executable_dir_writable {
@@ -215,26 +264,47 @@ fn package_is(value: Option<&str>, expected: &str) -> bool {
 /// Whether the executable sits in `…/<Something>.app/Contents/MacOS/`, which is
 /// the only layout a macOS DMG produces.
 fn is_macos_app_bundle(evidence: &InstallationEvidence) -> bool {
-    let Some(executable) = evidence.executable_path.as_deref() else {
-        return false;
-    };
-    let Some(macos_dir) = executable.parent() else {
-        return false;
-    };
-    if macos_dir.file_name().and_then(|name| name.to_str()) != Some("MacOS") {
-        return false;
+    evidence
+        .executable_path
+        .as_deref()
+        .and_then(macos_app_bundle_path)
+        .is_some()
+}
+
+/// The `…/<Something>.app` directory containing `executable`, when the
+/// executable really sits at `<bundle>/Contents/MacOS/<name>`.
+///
+/// Evidence collection and classification both go through this so they can
+/// never disagree about what "is a bundle" means.
+pub fn macos_app_bundle_path(executable: &Path) -> Option<&Path> {
+    let macos_dir = executable.parent()?;
+    if macos_dir.file_name()?.to_str()? != "MacOS" {
+        return None;
     }
-    let Some(contents_dir) = macos_dir.parent() else {
-        return false;
-    };
-    if contents_dir.file_name().and_then(|name| name.to_str()) != Some("Contents") {
-        return false;
+    let contents_dir = macos_dir.parent()?;
+    if contents_dir.file_name()?.to_str()? != "Contents" {
+        return None;
     }
-    contents_dir
-        .parent()
-        .and_then(|bundle| bundle.file_name())
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with(".app"))
+    let bundle = contents_dir.parent()?;
+    bundle
+        .file_name()?
+        .to_str()?
+        .ends_with(".app")
+        .then_some(bundle)
+}
+
+/// Whether `path` is inside Gatekeeper's App Translocation mount.
+///
+/// A translocated launch sees the bundle at a randomized read-only path under
+/// `/private/var/folders/…/AppTranslocation/<uuid>/d/<Name>.app`, and the real
+/// install is somewhere else entirely, so nothing there may be replaced.
+pub fn is_app_translocated(path: &Path) -> bool {
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|name| name == "AppTranslocation")
+    })
 }
 
 fn is_homebrew_layout(evidence: &InstallationEvidence) -> bool {
@@ -310,28 +380,25 @@ mod tests {
         );
     }
 
-    /// The DMG's bundle is writable by an admin user, so the only thing that
-    /// keeps the in-app upgrade from replacing binaries inside a signed bundle
-    /// is the layout itself being recognized. A macOS install outside a bundle
-    /// is still an ordinary portable install.
-    #[test]
-    fn a_macos_app_bundle_is_upgraded_by_download_not_in_place() {
-        let mut bundled = evidence();
-        bundled.os = InstallationOs::Macos;
-        bundled.executable_path = Some(PathBuf::from(
-            "/Applications/Scryer.app/Contents/MacOS/scryer",
+    /// An eligible bundle install: the real bundle, on a writable volume, with
+    /// the tray inside it supervising this process.
+    fn bundle_evidence() -> InstallationEvidence {
+        let mut evidence = evidence();
+        evidence.os = InstallationOs::Macos;
+        evidence.executable_path = Some(PathBuf::from(
+            "/Applications/ExampleApp.app/Contents/MacOS/exampleapp",
         ));
-        assert_assessment(
-            bundled,
-            InstallationKind::Unsupported,
-            ManagementOwner::Operator,
-            false,
-            EligibilityReason::UnsupportedLayout,
-        );
+        evidence.macos_app_bundle_parent_writable = true;
+        evidence.tray_supervised = true;
+        evidence
+    }
 
+    /// A macOS install outside a bundle is still an ordinary portable install.
+    #[test]
+    fn a_macos_install_outside_a_bundle_is_portable() {
         let mut loose = evidence();
         loose.os = InstallationOs::Macos;
-        loose.executable_path = Some(PathBuf::from("/Users/example/scryer/scryer"));
+        loose.executable_path = Some(PathBuf::from("/Users/example/exampleapp/exampleapp"));
         assert_assessment(
             loose,
             InstallationKind::Portable,
@@ -339,6 +406,132 @@ mod tests {
             true,
             EligibilityReason::Eligible,
         );
+    }
+
+    #[test]
+    fn a_supervised_writable_app_bundle_is_upgraded_in_place() {
+        assert_assessment(
+            bundle_evidence(),
+            InstallationKind::MacosAppBundle,
+            ManagementOwner::InApp,
+            true,
+            EligibilityReason::Eligible,
+        );
+    }
+
+    #[test]
+    fn a_translocated_app_bundle_is_not_eligible() {
+        let mut translocated = bundle_evidence();
+        translocated.macos_app_translocated = true;
+        assert_assessment(
+            translocated,
+            InstallationKind::MacosAppBundle,
+            ManagementOwner::Operator,
+            false,
+            EligibilityReason::AppBundleTranslocated,
+        );
+    }
+
+    /// The distribution disk image is mounted read-only, and a bundle running
+    /// from it was never installed at all.
+    #[test]
+    fn an_app_bundle_on_a_read_only_volume_is_not_eligible() {
+        let mut mounted = bundle_evidence();
+        mounted.macos_bundle_volume_read_only = true;
+        assert_assessment(
+            mounted,
+            InstallationKind::MacosAppBundle,
+            ManagementOwner::Operator,
+            false,
+            EligibilityReason::AppBundleReadOnlyVolume,
+        );
+    }
+
+    #[test]
+    fn an_app_bundle_whose_parent_is_not_writable_is_not_eligible() {
+        let mut read_only_parent = bundle_evidence();
+        read_only_parent.macos_app_bundle_parent_writable = false;
+        assert_assessment(
+            read_only_parent,
+            InstallationKind::MacosAppBundle,
+            ManagementOwner::Operator,
+            false,
+            EligibilityReason::InstallDirNotWritable,
+        );
+    }
+
+    /// Nothing else can relaunch the application once the bundle — the tray
+    /// binary included — has been replaced, so an unsupervised bundle is left
+    /// to the operator rather than given a second, invented restart path.
+    #[test]
+    fn an_unsupervised_app_bundle_is_not_eligible() {
+        let mut unsupervised = bundle_evidence();
+        unsupervised.tray_supervised = false;
+        assert_assessment(
+            unsupervised,
+            InstallationKind::MacosAppBundle,
+            ManagementOwner::Operator,
+            false,
+            EligibilityReason::AppBundleNotTraySupervised,
+        );
+    }
+
+    /// Translocation is reported ahead of every other disqualifier: the path
+    /// the process sees is not the install, so nothing else observed about it
+    /// describes the install either.
+    #[test]
+    fn translocation_precedes_every_other_bundle_disqualifier() {
+        let mut everything_wrong = bundle_evidence();
+        everything_wrong.macos_app_translocated = true;
+        everything_wrong.macos_bundle_volume_read_only = true;
+        everything_wrong.macos_app_bundle_parent_writable = false;
+        everything_wrong.tray_supervised = false;
+        assert_eq!(
+            classify_installation(&everything_wrong).reason,
+            EligibilityReason::AppBundleTranslocated
+        );
+    }
+
+    /// Docker, Homebrew and the operator kill switch still outrank a bundle.
+    #[test]
+    fn managed_evidence_precedes_an_eligible_app_bundle() {
+        let mut disabled = bundle_evidence();
+        disabled.disable_self_upgrade = Some("1".to_string());
+        assert_eq!(
+            classify_installation(&disabled).kind,
+            InstallationKind::Disabled
+        );
+
+        let mut homebrew = bundle_evidence();
+        homebrew.package = Some("homebrew".to_string());
+        assert_eq!(
+            classify_installation(&homebrew).kind,
+            InstallationKind::Homebrew
+        );
+    }
+
+    #[test]
+    fn recognizes_the_bundle_directory_and_translocated_paths() {
+        assert_eq!(
+            macos_app_bundle_path(Path::new(
+                "/Applications/ExampleApp.app/Contents/MacOS/exampleapp"
+            )),
+            Some(Path::new("/Applications/ExampleApp.app"))
+        );
+        for path in [
+            "/Applications/ExampleApp.app/Contents/exampleapp",
+            "/Applications/ExampleApp/Contents/MacOS/exampleapp",
+            "/usr/local/bin/exampleapp",
+        ] {
+            assert_eq!(macos_app_bundle_path(Path::new(path)), None, "{path}");
+        }
+
+        assert!(is_app_translocated(Path::new(
+            "/private/var/folders/x1/AppTranslocation/0BC/d/ExampleApp.app"
+        )));
+        assert!(!is_app_translocated(Path::new(
+            "/Applications/ExampleApp.app"
+        )));
     }
 
     #[test]

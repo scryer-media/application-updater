@@ -144,13 +144,30 @@ pub fn release_asset_url(
     tag: &str,
     filename: &str,
 ) -> Result<url::Url> {
-    let mut url = url::Url::parse(&format!(
-        "https://github.com/{}/releases/download/",
-        product.release_repository
-    ))
-    .map_err(|error| Error::Repository(format!("invalid release URL base: {error}")))?;
+    release_asset_url_in(None, product, tag, filename)
+}
+
+/// The release-asset URL for `filename` in release `tag`, below `base` when a
+/// host's tests supply one in place of the canonical download host.
+fn release_asset_url_in(
+    base: Option<&url::Url>,
+    product: &ProductDescriptor,
+    tag: &str,
+    filename: &str,
+) -> Result<url::Url> {
+    let mut url = match base {
+        Some(base) => base.clone(),
+        None => url::Url::parse(&format!(
+            "https://github.com/{}/releases/download/",
+            product.release_repository
+        ))
+        .map_err(|error| Error::Repository(format!("invalid release URL base: {error}")))?,
+    };
     url.path_segments_mut()
         .map_err(|_| Error::Repository("release URL base cannot accept path segments".to_string()))?
+        // The base ends in a slash, which parses as a trailing empty segment;
+        // without dropping it every asset URL would carry a doubled slash.
+        .pop_if_empty()
         .push(tag)
         .push(filename);
     Ok(url)
@@ -198,6 +215,215 @@ pub async fn fetch_capped_bytes(
     Ok(bytes)
 }
 
+/// Fetch a small resource, distinguishing "the server does not have this" from
+/// every other failure.
+///
+/// Only a 404 becomes `Ok(None)`. A 403, a 500, a TLS failure or a connection
+/// reset all stay errors, because none of them is evidence that the asset is
+/// absent.
+pub async fn fetch_optional_capped_bytes(
+    client: &reqwest::Client,
+    url: &str,
+    cap: u64,
+    label: &str,
+) -> Result<Option<Vec<u8>>> {
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| Error::Repository(format!("failed to fetch {label}: {error}")))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let response = response
+        .error_for_status()
+        .map_err(|error| Error::Repository(format!("failed to fetch {label}: {error}")))?;
+    if response
+        .content_length()
+        .is_some_and(|content_length| content_length > cap)
+    {
+        return Err(Error::Validation(format!(
+            "{label} exceeds the maximum size of {cap} bytes"
+        )));
+    }
+
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|error| Error::Repository(format!("failed to read {label}: {error}")))?;
+        let next_len = u64::try_from(bytes.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+        if next_len > cap {
+            return Err(Error::Validation(format!(
+                "{label} exceeds the maximum size of {cap} bytes"
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(Some(bytes))
+}
+
+/// Which manifest generation a release was read from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpgradeManifestGeneration {
+    /// The frozen v1 manifest.
+    V1,
+    /// The forward-tolerant v2 manifest.
+    V2,
+}
+
+/// A signature-verified, validated upgrade manifest and the generation it came
+/// from.
+pub struct FetchedUpgradeManifest {
+    /// The generation actually used.
+    pub generation: UpgradeManifestGeneration,
+    /// The artifacts this client understands, in the shape the rest of the
+    /// pipeline consumes. For v2 this excludes artifacts naming values this
+    /// build has never heard of.
+    pub manifest: UpgradeManifest,
+}
+
+/// Fetch, verify and validate the release manifest for `release_tag`.
+///
+/// v2 is tried first and v1 is used only when the v2 manifest asset is *absent*
+/// — an HTTP 404 for that tag, which is exactly what a release published before
+/// v2 existed returns. Every other v2 outcome is fatal: a signature failure, a
+/// validation failure, an oversized document, a network error or any non-404
+/// status aborts the upgrade rather than silently falling back, because a
+/// client that downgrades on failure hands an attacker a downgrade oracle.
+///
+/// The v2 signature bundle is likewise required once the v2 manifest exists; a
+/// manifest published without its signature is a hard failure.
+pub async fn fetch_upgrade_manifest(
+    product: &ProductDescriptor,
+    client: &reqwest::Client,
+    release_tag: &str,
+) -> Result<FetchedUpgradeManifest> {
+    fetch_upgrade_manifest_inner(
+        product,
+        client,
+        release_tag,
+        UpgradeManifestFetchOverrides::default(),
+    )
+    .await
+}
+
+/// Test seams for [`fetch_upgrade_manifest`].
+///
+/// Both are `None` in production, where the manifests come from the product's
+/// own release host and are verified against its pinned signing identity. A
+/// host's tests set them to exercise the fetch *order* — which is the part that
+/// is host-agnostic policy — against a local server, without needing a genuine
+/// signed release for every case.
+#[derive(Default)]
+pub struct UpgradeManifestFetchOverrides<'a> {
+    /// Replaces `https://<host>/<repo>/releases/download/` as the base the
+    /// `<tag>/<asset>` segments are appended to.
+    pub asset_base: Option<&'a url::Url>,
+    /// Replaces signature verification. Called with the raw manifest bytes, the
+    /// raw bundle bytes and the release tag.
+    pub verify_signature: Option<fn(&[u8], &[u8], &str) -> Result<()>>,
+}
+
+/// [`fetch_upgrade_manifest`] with its test seams exposed.
+/// Only built for tests: the overrides can stand in for signature
+/// verification, which no shipped binary may be able to do.
+#[cfg(any(test, feature = "test-seams"))]
+pub async fn fetch_upgrade_manifest_with_overrides(
+    product: &ProductDescriptor,
+    client: &reqwest::Client,
+    release_tag: &str,
+    overrides: UpgradeManifestFetchOverrides<'_>,
+) -> Result<FetchedUpgradeManifest> {
+    fetch_upgrade_manifest_inner(product, client, release_tag, overrides).await
+}
+
+async fn fetch_upgrade_manifest_inner(
+    product: &ProductDescriptor,
+    client: &reqwest::Client,
+    release_tag: &str,
+    overrides: UpgradeManifestFetchOverrides<'_>,
+) -> Result<FetchedUpgradeManifest> {
+    let base = overrides.asset_base;
+    let verify = async |raw: &[u8], bundle: &[u8]| -> Result<()> {
+        match overrides.verify_signature {
+            Some(verify_signature) => verify_signature(raw, bundle, release_tag),
+            None => {
+                verify_upgrade_manifest_signature(
+                    product,
+                    raw.to_vec(),
+                    bundle.to_vec(),
+                    release_tag,
+                )
+                .await
+            }
+        }
+    };
+
+    let v2_manifest_url =
+        release_asset_url_in(base, product, release_tag, product.manifest_v2_asset_name)?;
+    let v2_raw = fetch_optional_capped_bytes(
+        client,
+        v2_manifest_url.as_str(),
+        crate::manifest::UPGRADE_MANIFEST_MAX_BYTES,
+        "v2 upgrade manifest",
+    )
+    .await?;
+
+    if let Some(v2_raw) = v2_raw {
+        let v2_bundle_url = release_asset_url_in(
+            base,
+            product,
+            release_tag,
+            product.manifest_v2_signature_asset_name,
+        )?;
+        let v2_bundle_raw = fetch_capped_bytes(
+            client,
+            v2_bundle_url.as_str(),
+            UPGRADE_BUNDLE_MAX_BYTES,
+            "v2 upgrade manifest signature bundle",
+        )
+        .await?;
+        verify(&v2_raw, &v2_bundle_raw).await?;
+        let validated = crate::manifest::parse_and_validate_upgrade_manifest_v2(product, &v2_raw)?;
+        return Ok(FetchedUpgradeManifest {
+            generation: UpgradeManifestGeneration::V2,
+            manifest: validated.understood,
+        });
+    }
+
+    let manifest_url =
+        release_asset_url_in(base, product, release_tag, product.manifest_asset_name)?;
+    let bundle_url = release_asset_url_in(
+        base,
+        product,
+        release_tag,
+        product.manifest_signature_asset_name,
+    )?;
+    let manifest_raw = fetch_capped_bytes(
+        client,
+        manifest_url.as_str(),
+        crate::manifest::UPGRADE_MANIFEST_MAX_BYTES,
+        "upgrade manifest",
+    )
+    .await?;
+    let bundle_raw = fetch_capped_bytes(
+        client,
+        bundle_url.as_str(),
+        UPGRADE_BUNDLE_MAX_BYTES,
+        "upgrade manifest signature bundle",
+    )
+    .await?;
+    verify(&manifest_raw, &bundle_raw).await?;
+    let manifest = crate::manifest::parse_and_validate_upgrade_manifest(product, &manifest_raw)?;
+    Ok(FetchedUpgradeManifest {
+        generation: UpgradeManifestGeneration::V1,
+        manifest,
+    })
+}
+
 /// The artifact in `manifest` matching this host's platform, architecture and
 /// installation channel.
 pub fn select_artifact(
@@ -226,6 +452,7 @@ pub fn select_artifact(
     let channel = match installation_kind {
         InstallationKind::Portable => UpgradeChannel::Portable,
         InstallationKind::DirectMsi => UpgradeChannel::Msi,
+        InstallationKind::MacosAppBundle => UpgradeChannel::App,
         _ => {
             return Err(Error::Validation(
                 "application upgrade installation is not eligible".to_string(),
@@ -361,6 +588,9 @@ fn validate_tar_members(path: &Path, artifact: &UpgradeArtifact) -> Result<()> {
     for entry in archive.entries().map_err(archive_error)? {
         let entry = entry.map_err(archive_error)?;
         let member_path = archive_member_path(entry.path().map_err(archive_error)?.as_ref())?;
+        if entry.header().entry_type().is_dir() && allows_directory_entries(artifact) {
+            continue;
+        }
         if !entry.header().entry_type().is_file() {
             return Err(Error::Validation(format!(
                 "upgrade archive member '{member_path}' is not a regular file"
@@ -414,6 +644,12 @@ fn extract_tar(path: &Path, artifact: &UpgradeArtifact, destination: &Path) -> R
     for entry in archive.entries().map_err(archive_error)? {
         let mut entry = entry.map_err(archive_error)?;
         let member_path = archive_member_path(entry.path().map_err(archive_error)?.as_ref())?;
+        // A directory entry carries no content; the parents of every admitted
+        // member are created below regardless. Only the nested-tree channels
+        // ship them, and they are never given a mode of their own.
+        if entry.header().entry_type().is_dir() && allows_directory_entries(artifact) {
+            continue;
+        }
         let member = expected.get(&member_path).ok_or_else(|| {
             Error::Validation(format!("unexpected upgrade archive member '{member_path}'"))
         })?;
@@ -435,6 +671,17 @@ fn extract_tar(path: &Path, artifact: &UpgradeArtifact, destination: &Path) -> R
         )?;
     }
     Ok(())
+}
+
+/// Whether this artifact's container may carry bare directory entries.
+///
+/// The flat portable and MSI containers never do, and an entry that is not a
+/// regular file in one of those is a red flag worth failing on. A macOS `.app`
+/// is a directory tree, and `tar` records every directory in it; those entries
+/// hold no content, are still path-validated, and are simply skipped. Symlinks
+/// and every other non-regular entry stay rejected in both.
+fn allows_directory_entries(artifact: &UpgradeArtifact) -> bool {
+    artifact.channel == UpgradeChannel::App
 }
 
 fn artifact_member_paths(artifact: &UpgradeArtifact) -> BTreeMap<String, UpgradeArtifactMember> {
@@ -750,6 +997,20 @@ fn archive_error(error: impl std::fmt::Display) -> Error {
 pub(crate) mod tests {
     use super::*;
     use crate::product::test_product::EXAMPLEAPP;
+
+    #[test]
+    fn a_release_asset_url_is_the_canonical_download_url() {
+        let url = release_asset_url(&EXAMPLEAPP, "v0.18.22", "exampleapp-upgrade-manifest.json")
+            .expect("release asset URL");
+        assert_eq!(
+            url.as_str(),
+            format!(
+                "{}exampleapp-upgrade-manifest.json",
+                EXAMPLEAPP.release_download_prefix("v0.18.22")
+            )
+        );
+        assert!(!url.path().contains("//"), "{url}");
+    }
 
     fn portable_tar_artifact(size: u64) -> UpgradeArtifact {
         UpgradeArtifact {
