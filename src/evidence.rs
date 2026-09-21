@@ -351,19 +351,27 @@ fn executable_under_program_files(executable_path: Option<&Path>) -> bool {
     let Some(executable_path) = executable_path else {
         return false;
     };
-    let executable = executable_path.to_string_lossy().to_ascii_lowercase();
-
     ["ProgramFiles", "ProgramW6432"].into_iter().any(|name| {
         env::var_os(name).is_some_and(|program_files| {
-            let program_files = PathBuf::from(program_files);
-            let program_files = program_files.to_string_lossy().to_ascii_lowercase();
-            let program_files = program_files.trim_end_matches(['\\', '/']);
-            executable == program_files
-                || executable
-                    .strip_prefix(program_files)
-                    .is_some_and(|suffix| suffix.starts_with(['\\', '/']))
+            canonical_directory_contains(executable_path, Path::new(&program_files))
         })
     })
+}
+
+/// The executable is already canonical. Resolve the root as well so Windows
+/// extended-length prefixes and directory junctions use the same representation.
+#[cfg(any(windows, test))]
+fn canonical_directory_contains(executable: &Path, directory: &Path) -> bool {
+    let Ok(directory) = fs::canonicalize(directory) else {
+        return false;
+    };
+    let executable = executable.to_string_lossy().to_ascii_lowercase();
+    let directory = directory.to_string_lossy().to_ascii_lowercase();
+    let directory = directory.trim_end_matches(['\\', '/']);
+    executable == directory
+        || executable
+            .strip_prefix(directory)
+            .is_some_and(|suffix| suffix.starts_with(['\\', '/']))
 }
 
 #[cfg(not(windows))]
@@ -374,6 +382,71 @@ fn executable_under_program_files(_executable_path: Option<&Path>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_program_files_root_recognizes_legacy_msi_without_write_access() {
+        use crate::installation::{EligibilityReason, InstallationKind, ManagementOwner};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("Program Files");
+        let install = root.join("ExampleApp");
+        fs::create_dir_all(&install).expect("create synthetic install");
+        let binary = install.join("exampleapp.exe");
+        fs::write(&binary, b"fixture").expect("write fixture");
+        let executable = fs::canonicalize(binary).expect("canonical executable");
+        // On Windows this executable has the extended-length prefix, while
+        // the root passed to the production helper need not have it.
+        let under_root = canonical_directory_contains(&executable, &root);
+        assert!(under_root);
+        assert!(canonical_directory_contains(&executable, &root.join(".")));
+        let mut evidence = InstallationEvidence {
+            executable_path: Some(executable),
+            executable_dir_writable: false,
+            os: InstallationOs::Windows,
+            windows_legacy_msi_registry_key_exists: true,
+            windows_executable_under_program_files: under_root,
+            tray_supervised: true,
+            ..Default::default()
+        };
+        let assessment = classify_installation(&evidence);
+        assert_eq!(assessment.kind, InstallationKind::DirectMsi);
+        assert_eq!(assessment.owner, ManagementOwner::InApp);
+        assert_eq!(assessment.reason, EligibilityReason::Eligible);
+        assert!(assessment.eligible);
+        assert!(assessment.tray_supervised);
+
+        evidence.windows_distribution_owner = Some("winget".into());
+        assert_eq!(
+            classify_installation(&evidence).kind,
+            InstallationKind::Winget
+        );
+        evidence.windows_session_zero = true;
+        assert_eq!(
+            classify_installation(&evidence).kind,
+            InstallationKind::WindowsSupervised
+        );
+        evidence.windows_session_zero = false;
+        evidence.windows_distribution_owner = None;
+        evidence.windows_legacy_msi_registry_key_exists = false;
+        assert!(!classify_installation(&evidence).eligible);
+    }
+
+    #[test]
+    fn canonical_program_files_root_rejects_siblings_and_missing_roots() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("Program Files");
+        let sibling = temp.path().join("Program Files Other");
+        fs::create_dir_all(&root).expect("create root");
+        fs::create_dir_all(&sibling).expect("create sibling");
+        let binary = sibling.join("exampleapp.exe");
+        fs::write(&binary, b"fixture").expect("write fixture");
+        let executable = fs::canonicalize(binary).expect("canonical executable");
+        assert!(!canonical_directory_contains(&executable, &root));
+        assert!(!canonical_directory_contains(
+            &executable,
+            &root.join("missing")
+        ));
+    }
 
     #[test]
     fn recognizes_task_scheduler_parent_images() {
