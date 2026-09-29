@@ -590,6 +590,9 @@ fn validate_tar_members(path: &Path, artifact: &UpgradeArtifact) -> Result<()> {
     let mut actual = BTreeMap::new();
     for entry in archive.entries().map_err(archive_error)? {
         let entry = entry.map_err(archive_error)?;
+        if is_archive_root_entry(&entry)? {
+            continue;
+        }
         let member_path = archive_member_path(entry.path().map_err(archive_error)?.as_ref())?;
         if entry.header().entry_type().is_dir() && allows_directory_entries(artifact) {
             continue;
@@ -646,6 +649,9 @@ fn extract_tar(path: &Path, artifact: &UpgradeArtifact, destination: &Path) -> R
     let expected = artifact_member_paths(artifact);
     for entry in archive.entries().map_err(archive_error)? {
         let mut entry = entry.map_err(archive_error)?;
+        if is_archive_root_entry(&entry)? {
+            continue;
+        }
         let member_path = archive_member_path(entry.path().map_err(archive_error)?.as_ref())?;
         // A directory entry carries no content; the parents of every admitted
         // member are created below regardless. Only the nested-tree channels
@@ -674,6 +680,24 @@ fn extract_tar(path: &Path, artifact: &UpgradeArtifact, destination: &Path) -> R
         )?;
     }
     Ok(())
+}
+
+/// Whether this entry is the archive's own root directory.
+///
+/// `tar -C dir .` records the directory it was pointed at as `./` before any
+/// member. That entry names no member and carries no content, and extraction
+/// already owns the destination root, so it is skipped in every channel. It
+/// has to be recognized before path validation, which refuses a path that
+/// normalizes to nothing. Only a directory qualifies; a regular file named `.`
+/// still reaches that refusal.
+fn is_archive_root_entry<R: Read>(entry: &tar::Entry<'_, R>) -> Result<bool> {
+    if !entry.header().entry_type().is_dir() {
+        return Ok(false);
+    }
+    let path = entry.path().map_err(archive_error)?;
+    Ok(path
+        .components()
+        .all(|component| component == Component::CurDir))
 }
 
 /// Whether this artifact's container may carry bare directory entries.
@@ -1152,6 +1176,51 @@ pub(crate) mod tests {
         let error = validate_archive_members(&archive_path, &mismatch)
             .expect_err("signed member size must match");
         assert!(error.to_string().contains("do not exactly match"));
+    }
+
+    /// `tar -C dir .` writes the directory it was pointed at as a `./` entry,
+    /// then every member under a `./` prefix. That is the shape every release
+    /// workflow publishes, so it validates and extracts as exactly the signed
+    /// members.
+    #[test]
+    fn portable_tar_archive_written_from_its_directory_validates_and_extracts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive_path = temp.path().join("upgrade.tar.gz");
+        let encoder = flate2::write::GzEncoder::new(
+            fs::File::create(&archive_path).expect("create archive"),
+            flate2::Compression::default(),
+        );
+        let mut archive = tar::Builder::new(encoder);
+        let mut root = tar::Header::new_gnu();
+        root.set_path("./").expect("set root path");
+        root.set_entry_type(tar::EntryType::Directory);
+        root.set_size(0);
+        root.set_mode(0o755);
+        root.set_cksum();
+        archive
+            .append(&root, &[][..])
+            .expect("append root directory");
+        let bytes = b"new executable";
+        let mut header = tar::Header::new_gnu();
+        header.set_path("./exampleapp").expect("set member path");
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive.append(&header, &bytes[..]).expect("append member");
+        archive
+            .into_inner()
+            .expect("finish tar")
+            .finish()
+            .expect("finish gzip");
+
+        let artifact = portable_tar_artifact(bytes.len() as u64);
+        validate_archive_members(&archive_path, &artifact).expect("root entry is not a member");
+        let extracted = temp.path().join("extracted");
+        extract_archive(&archive_path, &artifact, &extracted).expect("extract archive");
+        assert_eq!(
+            fs::read(extracted.join("exampleapp")).expect("read extracted member"),
+            bytes
+        );
     }
 
     #[test]
