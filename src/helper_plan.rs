@@ -12,6 +12,13 @@ use crate::ProductDescriptor;
 /// exit and for the installed executables to be released.
 pub const APPLICATION_UPGRADE_HELPER_WAIT_BUDGET: Duration = Duration::from_secs(60);
 
+/// How much of [`APPLICATION_UPGRADE_HELPER_WAIT_BUDGET`] the helper spends
+/// waiting for the processes the plan names to exit on their own. Whatever is
+/// still running afterwards is stopped by name, which takes at most
+/// [`crate::windows_process::StopPolicy::DEFAULT`]'s budget, and the rest of
+/// the budget is left for the portable file-release probe.
+pub const APPLICATION_UPGRADE_OWNER_EXIT_WAIT: Duration = Duration::from_secs(30);
+
 /// Durable instructions consumed by the temporary Windows upgrade helper.
 ///
 /// The schema is frozen: a helper built from one release must be able to read a
@@ -232,6 +239,35 @@ pub fn msi_exit_code_transition(code: u32) -> MsiHelperJournalTransition {
     }
 }
 
+/// [`msi_exit_code_transition`], naming the installer's verbose log in every
+/// failure the installer itself reported. A declined elevation never started
+/// the installer, so it has no log to name.
+pub fn msi_exit_code_transition_with_log(
+    code: u32,
+    log_path: Option<&Path>,
+) -> MsiHelperJournalTransition {
+    match (msi_exit_code_transition(code), log_path) {
+        (MsiHelperJournalTransition::HelperError(message), Some(log_path)) if code != 1223 => {
+            MsiHelperJournalTransition::HelperError(format!(
+                "{message}; installer log: {}",
+                log_path.display()
+            ))
+        }
+        (transition, _) => transition,
+    }
+}
+
+/// The `msiexec` arguments the helper runs an install with: a basic-UI
+/// install that never restarts the machine itself, logging verbosely to
+/// `log_path` when there is one.
+pub fn msiexec_install_parameters(msi_path: &Path, log_path: Option<&Path>) -> String {
+    let mut parameters = format!("/i \"{}\" /passive /norestart", msi_path.display());
+    if let Some(log_path) = log_path {
+        parameters.push_str(&format!(" /l*v \"{}\"", log_path.display()));
+    }
+    parameters
+}
+
 /// Whether an installer exit code represents a successful installation.
 pub fn msi_install_succeeded(code: u32) -> bool {
     matches!(code, 0 | 3010)
@@ -311,11 +347,55 @@ pub fn reboot_required_completion_allowed(
     expected_version_booted: bool,
     expected_executable_booted: bool,
 ) -> bool {
-    expected_version_booted
-        && expected_executable_booted
-        && written_at
-            .zip(boot_time)
-            .is_some_and(|(written_at, boot_time)| boot_time > written_at)
+    reboot_required_outcome(
+        written_at,
+        boot_time,
+        expected_version_booted,
+        expected_executable_booted,
+    ) == RebootRequiredOutcome::Complete
+}
+
+/// What a boot means for a run the installer left waiting on a reboot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RebootRequiredOutcome {
+    /// The system restarted and the expected version is what booted.
+    Complete,
+    /// No restart is evident since the run was written; the run keeps waiting.
+    AwaitReboot,
+    /// The system restarted after the run was written, yet a version other
+    /// than the expected one booted: the install the reboot was meant to
+    /// finish never happened, and waiting longer cannot change that.
+    NotInstalled,
+}
+
+/// Classify a reboot-required run on this boot.
+///
+/// `written_at` is when the run was handed to the installer (the host may fall
+/// back to the run's own start time for a journal that predates the field);
+/// `boot_time` is when the operating system last started. Without both there
+/// is no evidence of a restart, so the run keeps waiting.
+///
+/// A restart that brought back the expected version on a different executable
+/// path keeps waiting too: that is the existing completion rule, and it is not
+/// evidence that the install failed.
+pub fn reboot_required_outcome(
+    written_at: Option<DateTime<Utc>>,
+    boot_time: Option<DateTime<Utc>>,
+    expected_version_booted: bool,
+    expected_executable_booted: bool,
+) -> RebootRequiredOutcome {
+    let rebooted = written_at
+        .zip(boot_time)
+        .is_some_and(|(written_at, boot_time)| boot_time > written_at);
+    match (
+        rebooted,
+        expected_version_booted,
+        expected_executable_booted,
+    ) {
+        (true, true, true) => RebootRequiredOutcome::Complete,
+        (true, false, _) => RebootRequiredOutcome::NotInstalled,
+        _ => RebootRequiredOutcome::AwaitReboot,
+    }
 }
 
 pub fn path_is_within(path: &Path, root: &Path) -> bool {
@@ -525,6 +605,59 @@ mod tests {
     }
 
     #[test]
+    fn installer_failures_name_the_verbose_log_and_successes_are_unchanged() {
+        let log = PathBuf::from("C:/data/application-upgrade/msi-run-1.log");
+        assert_eq!(
+            msi_exit_code_transition_with_log(1603, Some(&log)),
+            MsiHelperJournalTransition::HelperError(format!(
+                "installer exit code 1603; installer log: {}",
+                log.display()
+            ))
+        );
+        assert_eq!(
+            msi_exit_code_transition_with_log(1223, Some(&log)),
+            MsiHelperJournalTransition::HelperError("elevation was declined".to_string())
+        );
+        assert_eq!(
+            msi_exit_code_transition_with_log(0, Some(&log)),
+            MsiHelperJournalTransition::Restarting
+        );
+        assert_eq!(
+            msi_exit_code_transition_with_log(3010, Some(&log)),
+            MsiHelperJournalTransition::RebootRequired
+        );
+        assert_eq!(
+            msi_exit_code_transition_with_log(1603, None),
+            MsiHelperJournalTransition::HelperError("installer exit code 1603".to_string())
+        );
+    }
+
+    #[test]
+    fn msiexec_runs_passive_without_restarting_and_logs_when_asked() {
+        let msi = PathBuf::from("C:/data/application-upgrade/staging/artifact");
+        let log = PathBuf::from("C:/data/application-upgrade/msi-run-1.log");
+        assert_eq!(
+            msiexec_install_parameters(&msi, None),
+            format!("/i \"{}\" /passive /norestart", msi.display())
+        );
+        assert_eq!(
+            msiexec_install_parameters(&msi, Some(&log)),
+            format!(
+                "/i \"{}\" /passive /norestart /l*v \"{}\"",
+                msi.display(),
+                log.display()
+            )
+        );
+    }
+
+    #[test]
+    fn the_owner_wait_and_a_default_stop_leave_budget_for_the_file_probe() {
+        let used = APPLICATION_UPGRADE_OWNER_EXIT_WAIT
+            + crate::windows_process::StopPolicy::DEFAULT.budget();
+        assert!(used < APPLICATION_UPGRADE_HELPER_WAIT_BUDGET);
+    }
+
+    #[test]
     fn replacement_rollback_reverses_completed_members_before_restoring_backups() {
         let plan = portable_plan();
         let operations = plan
@@ -559,6 +692,51 @@ mod tests {
                 operations[1].retain_backup_to.clone(),
                 operations[1].retain_backup_from.clone()
             )
+        );
+    }
+
+    #[test]
+    fn a_restart_that_brought_back_another_version_means_the_install_never_happened() {
+        let written_at = Utc.with_ymd_and_hms(2026, 8, 24, 12, 0, 0).single();
+        let rebooted = Utc.with_ymd_and_hms(2026, 8, 24, 12, 1, 0).single();
+        let not_rebooted = Utc.with_ymd_and_hms(2026, 8, 24, 11, 59, 0).single();
+        assert_eq!(
+            reboot_required_outcome(written_at, rebooted, false, true),
+            RebootRequiredOutcome::NotInstalled
+        );
+        assert_eq!(
+            reboot_required_outcome(written_at, rebooted, false, false),
+            RebootRequiredOutcome::NotInstalled
+        );
+        // Before any restart the old version booting is exactly what a
+        // pending install looks like.
+        assert_eq!(
+            reboot_required_outcome(written_at, not_rebooted, false, true),
+            RebootRequiredOutcome::AwaitReboot
+        );
+        // The boot time equal to the write is not a restart after it.
+        assert_eq!(
+            reboot_required_outcome(written_at, written_at, false, true),
+            RebootRequiredOutcome::AwaitReboot
+        );
+        // Without both timestamps there is no evidence either way.
+        assert_eq!(
+            reboot_required_outcome(None, rebooted, false, true),
+            RebootRequiredOutcome::AwaitReboot
+        );
+        assert_eq!(
+            reboot_required_outcome(written_at, None, false, true),
+            RebootRequiredOutcome::AwaitReboot
+        );
+        // The expected version from another executable keeps waiting, as the
+        // completion rule always has.
+        assert_eq!(
+            reboot_required_outcome(written_at, rebooted, true, false),
+            RebootRequiredOutcome::AwaitReboot
+        );
+        assert_eq!(
+            reboot_required_outcome(written_at, rebooted, true, true),
+            RebootRequiredOutcome::Complete
         );
     }
 

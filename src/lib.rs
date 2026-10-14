@@ -27,8 +27,9 @@ pub mod manifest;
 pub mod pipeline;
 pub mod product;
 pub mod windows_handoff;
+pub mod windows_process;
 
-pub use product::{ProductDescriptor, UpgradeDirectories};
+pub use product::{ProductDescriptor, UpgradeDirectories, msi_log_path_beside_journal};
 
 /// Stable progress phase names consumed by the application-upgrade UI and
 /// written into the durable journal. Frozen: a journal written by one release

@@ -32,6 +32,10 @@ url = "2"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
+    # Console interrupts and the process snapshot stop a product's own
+    # processes before an install (`windows_process`).
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_UI_Shell",
