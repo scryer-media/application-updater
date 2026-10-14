@@ -127,7 +127,7 @@ pub use self::windows::{
 #[cfg(windows)]
 mod windows {
     use std::path::Path;
-    use std::sync::{Mutex, Once};
+    use std::sync::Mutex;
     use std::time::Instant;
 
     use windows_sys::Win32::Foundation::{
@@ -268,23 +268,28 @@ mod windows {
         search.posted
     }
 
-    unsafe extern "system" fn swallow_console_interrupts(_ctrl_type: u32) -> BOOL {
-        1
-    }
-
     static CONSOLE_LOCK: Mutex<()> = Mutex::new(());
-    static INSTALL_CONSOLE_HANDLER: Once = Once::new();
 
     /// Deliver `CTRL_C_EVENT` to the console a process is attached to, which is
     /// how a windowless console server is asked to shut down gracefully.
     ///
-    /// The caller temporarily joins that console to raise the event, and this
-    /// process ignores the interrupt through a registered handler rather than
-    /// through `SetConsoleCtrlHandler(NULL, TRUE)`: the latter is inherited by
-    /// every child this process starts afterwards, which would leave a
-    /// relaunched server unable to be stopped the same way. Any console this
-    /// process had is released first, because a process may be attached to
-    /// only one.
+    /// The caller temporarily joins that console to raise the event. Any
+    /// console this process had is released first, because a process may be
+    /// attached to only one.
+    ///
+    /// Group 0 delivers the event to this process too, so it first sets the
+    /// process-wide ignore flag with `SetConsoleCtrlHandler(NULL, TRUE)`. A
+    /// registered handler that returns `TRUE` does not protect the sender:
+    /// measured on Windows, the sender still exited with
+    /// `STATUS_CONTROL_C_EXIT`, and only the ignore flag kept it alive.
+    ///
+    /// The flag is left set: the event reaches this process asynchronously, so
+    /// clearing it afterwards could race the delivery and kill the caller. The
+    /// calling process therefore ignores Ctrl+C for the rest of its lifetime,
+    /// and every child process it starts afterwards INHERITS the flag. Callers
+    /// that later start a console child which must answer Ctrl+C (a relaunched
+    /// server, for example) must clear the flag first, or the child must clear
+    /// it itself at startup.
     ///
     /// Returns whether the event was raised. A process started without a
     /// console (`DETACHED_PROCESS`) cannot be reached this way.
@@ -292,10 +297,9 @@ mod windows {
         let _guard = CONSOLE_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        INSTALL_CONSOLE_HANDLER.call_once(|| {
-            // SAFETY: The handler is a 'static function that never unwinds.
-            unsafe { SetConsoleCtrlHandler(Some(swallow_console_interrupts), 1) };
-        });
+        // SAFETY: A null handler with TRUE only sets this process's
+        // ignore-Ctrl+C flag.
+        unsafe { SetConsoleCtrlHandler(None, 1) };
         // SAFETY: Releasing this process's console, if it has one, is always
         // permitted; failure only means it had none.
         unsafe { FreeConsole() };
@@ -304,7 +308,7 @@ mod windows {
             return false;
         }
         // SAFETY: Group 0 addresses every process attached to the console this
-        // process just joined; this process swallows its own copy above.
+        // process just joined; this process ignores its own copy above.
         let raised = unsafe { GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0) } != 0;
         // SAFETY: Leave the borrowed console again.
         unsafe { FreeConsole() };
