@@ -10,14 +10,16 @@ use std::path::Path;
 use crate::ProductDescriptor;
 #[cfg(windows)]
 use crate::helper_plan::{
-    APPLICATION_UPGRADE_HELPER_WAIT_BUDGET, ApplicationUpgradeHelperMode,
-    ApplicationUpgradeHelperOwner, WriteProbeOutcome, classify_write_probe_error,
-    helper_wait_remaining, helper_write_probe_required, msi_install_succeeded,
-    open_process_failure_means_exited, should_restore_tray_startup,
+    APPLICATION_UPGRADE_HELPER_WAIT_BUDGET, APPLICATION_UPGRADE_OWNER_EXIT_WAIT,
+    ApplicationUpgradeHelperMode, ApplicationUpgradeHelperOwner, WriteProbeOutcome,
+    classify_write_probe_error, helper_wait_remaining, helper_write_probe_required,
+    msi_install_succeeded, open_process_failure_means_exited, should_restore_tray_startup,
 };
 use crate::helper_plan::{
     ApplicationUpgradeHelperPlan, MsiHelperJournalTransition, msi_exit_code_transition,
 };
+#[cfg(windows)]
+use crate::helper_plan::{msi_exit_code_transition_with_log, msiexec_install_parameters};
 
 /// The host's per-user "start at login" registration, which a Windows installer
 /// can drop during the removal half of a major upgrade.
@@ -108,9 +110,18 @@ fn run_windows_helper(
     plan: &ApplicationUpgradeHelperPlan,
 ) -> Result<(), String> {
     let outcome = (|| {
-        stop_owner(plan)?;
         let started = std::time::Instant::now();
-        wait_for_process_exit(&plan.wait_process_ids, started)?;
+        // Neither the owner's own shutdown nor the recorded process ids are the
+        // gate any more: an orphaned server answers to neither. Their failures
+        // are reported, and stopping the product's processes by name below is
+        // what decides whether the installation is free.
+        if let Err(error) = stop_owner(plan) {
+            eprintln!("{error}; stopping remaining processes directly");
+        }
+        if let Err(error) = wait_for_process_exit(&plan.wait_process_ids, started) {
+            eprintln!("{error}; stopping remaining processes directly");
+        }
+        stop_product_processes(product, plan)?;
         // msiexec owns in-use file semantics for MSI installs; probing there in
         // an unelevated helper only ever reports ERROR_ACCESS_DENIED against
         // Program Files and would burn the whole budget before the UAC prompt.
@@ -158,6 +169,39 @@ fn stop_owner(plan: &ApplicationUpgradeHelperPlan) -> Result<(), String> {
     }
 }
 
+/// Stop every product process still running from the installation, whether
+/// or not the plan recorded it: ask, wait a bounded time, then terminate.
+#[cfg(windows)]
+fn stop_product_processes(
+    product: &ProductDescriptor,
+    plan: &ApplicationUpgradeHelperPlan,
+) -> Result<(), String> {
+    use crate::windows_process::{StopPolicy, stop_product_processes};
+
+    let report = stop_product_processes(
+        product.windows_product_process_names,
+        &plan.install_dir,
+        &[],
+        StopPolicy::DEFAULT,
+    );
+    if !report.terminated.is_empty() {
+        eprintln!(
+            "terminated {} processes that did not exit when asked: {:?}",
+            product.display_name, report.terminated
+        );
+    }
+    if report.all_stopped() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} processes {:?} in {} are still running after being asked to exit and terminated",
+            product.display_name,
+            report.remaining,
+            plan.install_dir.display()
+        ))
+    }
+}
+
 #[cfg(windows)]
 fn installed_executables(plan: &ApplicationUpgradeHelperPlan) -> Vec<std::path::PathBuf> {
     plan.replace
@@ -166,11 +210,12 @@ fn installed_executables(plan: &ApplicationUpgradeHelperPlan) -> Vec<std::path::
         .collect()
 }
 
-/// Wait for every process the plan named to exit, within the shared budget.
+/// Wait for every process the plan named to exit, within
+/// [`APPLICATION_UPGRADE_OWNER_EXIT_WAIT`].
 ///
-/// This is the real gate: once the backend (and, for tray-owned plans, the tray
-/// it supervises) is gone, the installation is free for either msiexec or the
-/// portable replacement to touch.
+/// This is the polite half of the gate: the backend that wrote the plan exits
+/// on its own, and a tray-owned plan has just asked the tray to stop its
+/// server. Anything still running afterwards is stopped by name.
 #[cfg(windows)]
 fn wait_for_process_exit(process_ids: &[u32], started: std::time::Instant) -> Result<(), String> {
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, WAIT_OBJECT_0, WAIT_TIMEOUT};
@@ -180,7 +225,7 @@ fn wait_for_process_exit(process_ids: &[u32], started: std::time::Instant) -> Re
 
     for process_id in process_ids {
         let Some(remaining) =
-            helper_wait_remaining(started.elapsed(), APPLICATION_UPGRADE_HELPER_WAIT_BUDGET)
+            helper_wait_remaining(started.elapsed(), APPLICATION_UPGRADE_OWNER_EXIT_WAIT)
         else {
             return Err(format!(
                 "timed out waiting for process {process_id} to exit before upgrading"
@@ -333,12 +378,18 @@ fn run_msi_installer(
     // including the removal half of a major upgrade, so the preference has to be
     // observed before the installer runs and restored after it.
     let startup_was_registered = startup.startup_enabled().unwrap_or(false);
+    // The verbose log is what explains an installer that stalls or fails; its
+    // path is derived from the run id, so the host finds it without the plan
+    // or the journal carrying it.
+    let log_path = crate::journal::load_journal(&plan.journal_path)
+        .ok()
+        .flatten()
+        .and_then(|journal| {
+            crate::product::msi_log_path_beside_journal(&plan.journal_path, &journal.run_id)
+        });
     let verb = wide("runas");
     let program = wide("msiexec.exe");
-    let parameters = wide(&format!(
-        "/i \"{}\" /passive /norestart",
-        msi_path.display()
-    ));
+    let parameters = wide(&msiexec_install_parameters(msi_path, log_path.as_deref()));
     // SAFETY: Zero is the documented initializer for this Win32 structure; all
     // pointer fields below refer to NUL-terminated buffers that outlive the call.
     let mut execute: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
@@ -370,7 +421,10 @@ fn run_msi_installer(
         return Err("failed to read MSI installer exit code".to_string());
     }
     restore_tray_startup_after_install(product, startup, plan, startup_was_registered, exit_code);
-    write_msi_transition(plan, msi_exit_code_transition(exit_code))
+    write_msi_transition(
+        plan,
+        msi_exit_code_transition_with_log(exit_code, log_path.as_deref()),
+    )
 }
 
 /// Re-register the per-user tray Run value when the installer dropped it.

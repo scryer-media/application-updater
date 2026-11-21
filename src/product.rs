@@ -49,6 +49,15 @@ pub struct ProductDescriptor {
     pub windows_tray_executable: &'static str,
     /// Filename of the temporary Windows upgrade helper copy.
     pub windows_helper_executable: &'static str,
+    /// Every executable filename the product runs from its installation
+    /// directory on Windows, e.g. `["exampleapp.exe", "exampleapp-tray.exe"]`.
+    ///
+    /// Before an installer or a portable replacement touches the installation,
+    /// the helper stops every running process whose image is one of these
+    /// names directly inside that directory, including processes nothing
+    /// recorded (an orphaned server). List only the product's own long-running
+    /// executables; never the helper copy itself.
+    pub windows_product_process_names: &'static [&'static str],
     /// Filename prefix of the staged replacement executable written beside the
     /// installed one during a portable promotion.
     pub staged_replacement_prefix: &'static str,
@@ -126,6 +135,29 @@ impl UpgradeDirectories {
     pub fn journal_path(&self) -> PathBuf {
         self.root.join("journal.json")
     }
+
+    /// Where the Windows helper asks `msiexec` to write its verbose log for
+    /// one run, or `None` when the run id is not safe to put in a file name.
+    pub fn msi_log_path(&self, run_id: &str) -> Option<PathBuf> {
+        msi_log_path_beside_journal(&self.journal_path(), run_id)
+    }
+}
+
+/// The verbose `msiexec` log for one run: `msi-<run_id>.log` in the directory
+/// that holds the journal.
+///
+/// It is derived rather than stored so neither the frozen helper plan nor the
+/// frozen journal has to carry it: the helper knows the journal path and reads
+/// the run id from the journal, and the host knows both too.
+pub fn msi_log_path_beside_journal(journal_path: &Path, run_id: &str) -> Option<PathBuf> {
+    let safe = !run_id.is_empty()
+        && run_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'));
+    if !safe {
+        return None;
+    }
+    Some(journal_path.parent()?.join(format!("msi-{run_id}.log")))
 }
 
 #[cfg(test)]
@@ -150,6 +182,7 @@ pub(crate) mod test_product {
         windows_server_executable: "exampleapp.exe",
         windows_tray_executable: "exampleapp-tray.exe",
         windows_helper_executable: "exampleapp-upgrade-helper.exe",
+        windows_product_process_names: &["exampleapp.exe", "exampleapp-tray.exe"],
         staged_replacement_prefix: ".exampleapp-upgrade-new-",
         disable_self_upgrade_env: "EXAMPLEAPP_DISABLE_SELF_UPGRADE",
         package_env: "EXAMPLEAPP_PACKAGE",
@@ -193,6 +226,28 @@ mod tests {
         assert_eq!(
             dirs.journal_path(),
             PathBuf::from("/data/application-upgrade/journal.json")
+        );
+        assert_eq!(
+            dirs.msi_log_path("0b9f6c2e-4f7a-4a51-9d0e-2c3b4a5d6e7f"),
+            Some(PathBuf::from(
+                "/data/application-upgrade/msi-0b9f6c2e-4f7a-4a51-9d0e-2c3b4a5d6e7f.log"
+            ))
+        );
+    }
+
+    #[test]
+    fn msi_log_path_refuses_run_ids_that_would_leave_the_upgrade_directory() {
+        let journal = PathBuf::from("/data/application-upgrade/journal.json");
+        for run_id in ["", "../escape", "a\\b", "run id", "a\"quote"] {
+            assert_eq!(
+                msi_log_path_beside_journal(&journal, run_id),
+                None,
+                "{run_id}"
+            );
+        }
+        assert_eq!(
+            msi_log_path_beside_journal(&journal, "run_1-A"),
+            Some(PathBuf::from("/data/application-upgrade/msi-run_1-A.log"))
         );
     }
 }

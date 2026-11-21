@@ -1,6 +1,6 @@
 [package]
 name = "application-updater"
-version = "0.1.0"
+version = "0.1.3"
 edition = "2024"
 license-file = "LICENSE"
 repository = "https://github.com/scryer-media/application-updater"
@@ -13,7 +13,7 @@ description = "Signed in-application upgrade core: manifest validation, download
 test-seams = []
 
 [dependencies]
-artifact-trust = { git = "https://github.com/scryer-media/artifact-trust.git", tag = "v0.1.2", default-features = false, features = ["verification"] }
+artifact-trust = { git = "https://github.com/scryer-media/artifact-trust.git", tag = "v0.1.4", default-features = false, features = ["verification"] }
 blake3 = "1"
 chrono = { version = "0.4", features = ["serde"] }
 flate2 = "1"
@@ -24,7 +24,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 tar = "0.4"
 thiserror = "2.0"
-tokio = { version = "1.53", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.54", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1"
 url = "2"
 
@@ -32,6 +32,10 @@ url = "2"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
+    # Console interrupts and the process snapshot stop a product's own
+    # processes before an install (`windows_process`).
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_UI_Shell",
@@ -43,4 +47,4 @@ windows-sys = { version = "0.61.2", features = [
 # the process-wide provider, so the tests install one of their own.
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
 tempfile = "3"
-tokio = { version = "1.53", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.54", features = ["macros", "rt-multi-thread"] }

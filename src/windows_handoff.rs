@@ -244,7 +244,9 @@ pub fn write_helper_plan(path: &Path, plan: &ApplicationUpgradeHelperPlan) -> Re
 #[cfg(windows)]
 pub fn copy_and_spawn_windows_upgrade_helper(helper_path: &Path, plan_path: &Path) -> Result<()> {
     use std::os::windows::process::CommandExt;
-    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+    use windows_sys::Win32::System::Threading::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW};
+
+    const ERROR_ACCESS_DENIED: i32 = 5;
 
     let source = std::env::current_exe().map_err(|error| {
         Error::Repository(format!(
@@ -254,17 +256,28 @@ pub fn copy_and_spawn_windows_upgrade_helper(helper_path: &Path, plan_path: &Pat
     fs::copy(&source, helper_path).map_err(|error| {
         Error::Repository(format!("failed to copy temporary upgrade helper: {error}"))
     })?;
-    std::process::Command::new(helper_path)
-        .arg("--upgrade-helper")
-        .arg(plan_path)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-        .map_err(|error| {
-            Error::Repository(format!("failed to spawn temporary upgrade helper: {error}"))
-        })?;
+    let spawn = |flags: u32| {
+        std::process::Command::new(helper_path)
+            .arg("--upgrade-helper")
+            .arg(plan_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(flags)
+            .spawn()
+    };
+    // A supervising tray keeps its server in a kill-on-close job object, and
+    // the helper's first act is to stop that tray: left in the job, the helper
+    // would be killed by the very shutdown it asked for. Breaking away needs
+    // the job to allow it, so a parent job that does not falls back to an
+    // ordinary spawn, which is what every earlier release did.
+    let spawned = match spawn(CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB) {
+        Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED) => spawn(CREATE_NO_WINDOW),
+        result => result,
+    };
+    spawned.map_err(|error| {
+        Error::Repository(format!("failed to spawn temporary upgrade helper: {error}"))
+    })?;
     Ok(())
 }
 
